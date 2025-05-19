@@ -14,10 +14,32 @@ module EventMachine::Hiredis
     include EventEmitter
     include EM::Deferrable
 
-    attr_reader :host, :port, :password, :db
+    attr_reader :host, :port, :password, :db, :ssl_options
 
-    def initialize(host = 'localhost', port = 6379, password = nil, db = nil)
+    # SSL is now enforced. ssl_options defaults to {} if nil.
+    def initialize(host = 'localhost', port = 6379, password = nil, db = nil, ssl_options = nil)
+      @ssl_options = ssl_options.nil? ? {} : ssl_options
+      
+      # Check if host looks like a URI; if so, use configure.
+      # This simplifies initialization: new(uri_string, ssl_options_hash) or new(host, port, ..., ssl_options_hash)
+      begin
+        uri_candidate = URI(host)
+        if uri_candidate.scheme
+          # It's a URI, let configure handle it. Port, password, db from args are ignored.
+          configure(host)
+          # Note: configure might update @ssl_options further based on scheme.
+          # If original ssl_options were specific (e.g. certs), configure needs to respect them for rediss.
+          # The current configure logic: `@ssl_options = {} if @ssl_options.nil?` for rediss
+          # which is fine as @ssl_options is already {} or a hash here.
+          return # Initialization done by configure
+        end
+      rescue URI::InvalidURIError
+        # Not a valid URI, proceed with host/port parameters
+      end
+
       @host, @port, @password, @db = host, port, password, db
+      # @ssl_options already set at the beginning of initialize
+
       @defs = []
       @command_queue = []
 
@@ -36,23 +58,36 @@ module EventMachine::Hiredis
       }
     end
 
-    # Configure the redis connection to use
-    #
-    # In usual operation, the uri should be passed to initialize. This method
-    # is useful for example when failing over to a slave connection at runtime
-    #
+    # Configure the redis connection to use. Enforces rediss:// scheme.
     def configure(uri_string)
-      uri = URI(uri_string)
+      begin
+        uri = URI(uri_string)
+      rescue URI::InvalidURIError
+        raise ArgumentError, "Invalid URI: #{uri_string}"
+      end
 
-      if uri.scheme == "unix"
-        @host = uri.path
-        @port = nil
-      else
+      unless uri.scheme
+        raise ArgumentError, "Invalid URI: #{uri_string}. Scheme is missing; only rediss:// is supported."
+      end
+      
+      case uri.scheme
+      when "rediss"
         @host = uri.host
-        @port = uri.port
+        @port = uri.port || 6379 # Default Redis SSL port
         @password = uri.password
-        path = uri.path[1..-1]
-        @db = path.to_i # Empty path => 0
+        path = uri.path.to_s[1..-1]
+        @db = path.empty? ? 0 : path.to_i
+        # Ensure ssl_options is a hash. If configure is called externally and @ssl_options wasn't set
+        # by initialize (e.g. on an existing object), this ensures it.
+        # Given initialize now always sets @ssl_options to a hash, this line primarily ensures
+        # robustness if configure is used in other contexts.
+        @ssl_options = {} if @ssl_options.nil?
+      when "unix"
+        raise ArgumentError, "Unix domain sockets are not supported. Only rediss:// (SSL) connections are allowed."
+      when "redis"
+        raise ArgumentError, "Non-SSL connections (redis://) are not supported. Please use rediss://."
+      else
+        raise ArgumentError, "Unsupported URI scheme: '#{uri.scheme}'. Only rediss:// (SSL) connections are allowed."
       end
     end
 
@@ -71,7 +106,14 @@ module EventMachine::Hiredis
 
     def connect
       @auto_reconnect = true
-      @connection = EM.connect(@host, @port, Connection, @host, @port)
+      
+      unless @host && @port
+        # This should ideally not be reached if constructor/configure enforce parameters.
+        raise EventMachine::Hiredis::Error, "Connection host and port must be configured for SSL connections."
+      end
+      
+      # @ssl_options is guaranteed to be a hash by initialize/configure
+      @connection = EM.connect(@host, @port, Connection, @host, @port, @ssl_options)
 
       @connection.on(:closed) do
         cancel_inactivity_checks

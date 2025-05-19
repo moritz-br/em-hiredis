@@ -4,10 +4,17 @@ module EventMachine::Hiredis
   class Connection < EM::Connection
     include EventMachine::Hiredis::EventEmitter
 
-    def initialize(host, port)
-      super
+    def initialize(host, port, ssl_options)
+      super()
       @host, @port = host, port
-      @name = "[em-hiredis #{@host}:#{@port}]"
+      @ssl_options = ssl_options
+      @name = "[em-hiredis #{@host}"
+      @name << (@port ? ":#{@port}" : "")
+      @name << " (SSL)"
+      @name << "]"
+
+      @tls_established = false
+      @reader = nil
     end
 
     def reconnect(host, port)
@@ -15,12 +22,26 @@ module EventMachine::Hiredis
       @host, @port = host, port
     end
 
-    def connection_completed
+    def post_init
+      tls_params = @ssl_options.is_a?(Hash) ? @ssl_options : {}
+      start_tls(tls_params)
+    end
+
+    def ssl_handshake_completed
+      @tls_established = true
+      complete_connection_setup
+    end
+
+    def complete_connection_setup
+      return unless @tls_established && @reader.nil?
+
       @reader = ::Hiredis::Reader.new
       emit(:connected)
     end
 
     def receive_data(data)
+      return unless @tls_established && @reader
+
       @reader.feed(data)
       until (reply = @reader.gets) == false
         emit(:message, reply)
