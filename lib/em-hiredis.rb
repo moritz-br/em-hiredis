@@ -17,7 +17,7 @@ module EventMachine
     self.reconnect_timeout = 0.5
 
     def self.setup(uri = nil)
-      uri = uri || ENV["REDIS_URL"] || "redis://127.0.0.1:6379/0"
+      uri = uri || ENV["REDIS_URL"] || "rediss://127.0.0.1:6379/0"
       client = Client.new
       client.configure(uri)
       client
@@ -26,14 +26,11 @@ module EventMachine
     # Connects to redis and returns a client instance
     #
     # Will connect in preference order to the provided uri, the REDIS_URL
-    # environment variable, or localhost:6379
+    # environment variable, or rediss://localhost:6379 (default).
     #
-    # TCP connections are supported via redis://:password@host:port/db (only
-    # host and port components are required)
-    #
-    # Unix socket uris are supported, e.g. unix:///tmp/redis.sock, however
-    # it's not possible to set the db or password - use initialize instead in
-    # this case
+    # SSL connections are supported and required via rediss://:password@host:port/db
+    # (only host and port components are required).
+    # Non-SSL (redis://) and Unix socket (unix://) connections are no longer supported.
     def self.connect(uri = nil)
       client = setup(uri)
       client.connect
