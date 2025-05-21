@@ -25,10 +25,17 @@ module EventMachine::Hiredis
 
     def post_init
       # SSL is mandatory. @ssl_options should be pre-validated by BaseClient.
-      # BaseClient ensures @ssl_options[:ca_file] exists and
+      # BaseClient ensures @ssl_options[:ca_file] exists and we map it to cert_chain_file for EM
       # @ssl_options[:verify_peer] defaults to true if not set.
       EM::Hiredis.logger.debug { "#{to_s} Attempting to start TLS with params: #{@ssl_options.inspect}" }
-      start_tls(@ssl_options)
+      
+      # Map the ssl_options keys to what EventMachine's start_tls expects
+      tls_params_for_em = {}
+      tls_params_for_em[:cert_chain_file] = @ssl_options[:ca_file] if @ssl_options[:ca_file]
+      tls_params_for_em[:verify_peer] = @ssl_options.fetch(:verify_peer, true)
+      
+      EM::Hiredis.logger.debug { "#{to_s} Mapping SSL options to EM parameters: #{tls_params_for_em.inspect}" }
+      start_tls(tls_params_for_em)
     end
 
     def ssl_handshake_completed
