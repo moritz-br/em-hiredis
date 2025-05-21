@@ -4,10 +4,10 @@ module EventMachine::Hiredis
 
     PING_CHANNEL = '__em-hiredis-ping'
 
-    def initialize(host='localhost', port='6379', password=nil, db=nil, ssl_options=nil)
+    def initialize(host='localhost', port='6379', password=nil, db=nil, ssl_options = {}, sentinel_params = {})
       @subs, @psubs = [], []
       @pubsub_defs = Hash.new { |h,k| h[k] = [] }
-      super(host, port, password, db, ssl_options)
+      super(host, port, password, db, ssl_options, sentinel_params)
     end
 
     def connect
