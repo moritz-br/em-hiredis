@@ -2,11 +2,6 @@ require 'uri'
 require 'eventmachine' # Ensure EventMachine is available for EM::DefaultDeferrable
 
 module EventMachine::Hiredis
-  class Error < StandardError; end
-  class RedisError < Error
-    attr_accessor :redis_error
-  end
-
   # Emits the following events
   #
   # * :connected - on successful connection or reconnection
