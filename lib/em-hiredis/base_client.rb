@@ -29,13 +29,10 @@ module EventMachine::Hiredis
     DEFAULT_RECONNECT_DELAY = 1.0
 
     # sentinel_params: { sentinels: [{host: 'h', port: p, password: 'pw'}, ...], master_name: 'name', sentinel_password: 'global_sentinel_password_if_any'}
-    # ssl_options: { ca_file: 'path', verify_peer: true, sentinel_ssl_options: { ca_file: ...} (optional, if different for sentinels) }
+    # ssl_options: { ca_file: 'path', verify_peer: true } # verify_peer defaults to true if not specified.
     def initialize(host = 'localhost', port = 6379, password = nil, db = nil, ssl_options = {}, sentinel_params = {})
       # Store initial host/port primarily for reference; actual target comes from Sentinel.
-      @original_host = host 
-      @original_port = port 
-      @original_password = password # This is the password for the Redis master
-      @original_db = db || 0       # This is the DB for the Redis master
+      @direct_connection_mode = (sentinel_params == :_direct_connect_)
 
       unless ssl_options.is_a?(Hash) && ssl_options[:ca_file]
         raise ArgumentError, "ssl_options must be a Hash and include :ca_file for mandatory SSL."
@@ -43,23 +40,38 @@ module EventMachine::Hiredis
       @ssl_options = deep_copy(ssl_options)
       @ssl_options[:verify_peer] = true unless @ssl_options.key?(:verify_peer)
 
-      unless sentinel_params.is_a?(Hash) && 
-             sentinel_params[:sentinels].is_a?(Array) && !sentinel_params[:sentinels].empty? && 
-             sentinel_params[:master_name].is_a?(String) && !sentinel_params[:master_name].empty?
-        raise ArgumentError, "sentinel_params must include a non-empty :sentinels array and a :master_name string."
-      end
-      @sentinel_params = deep_copy(sentinel_params)
-      @current_sentinel_index = 0
+      if @direct_connection_mode
+        EM::Hiredis.logger.debug { "[EM::Hiredis::BaseClient] Initializing in Direct Connection Mode for #{host}:#{port}" }
+        @current_target_host = host
+        @current_target_port = port
+        @password = password
+        @db = db || 0
+        @sentinel_params = {} # Not used in direct mode
+      else
+        # Standard Sentinel-based initialization
+        @original_host = host 
+        @original_port = port 
+        @original_password = password # This is the password for the Redis master
+        @original_db = db || 0       # This is the DB for the Redis master
 
-      # Use the direct password and db params for the master connection
-      @password = @original_password 
-      @db = @original_db
+        unless sentinel_params.is_a?(Hash) && 
+               sentinel_params[:sentinels].is_a?(Array) && !sentinel_params[:sentinels].empty? && 
+               sentinel_params[:master_name].is_a?(String) && !sentinel_params[:master_name].empty?
+          raise ArgumentError, "sentinel_params must include a non-empty :sentinels array and a :master_name string."
+        end
+        @sentinel_params = deep_copy(sentinel_params)
+        @current_sentinel_index = 0
+
+        # Use the direct password and db params for the master connection (resolved via Sentinel)
+        @password = @original_password 
+        @db = @original_db
+
+        @current_target_host = nil # Will be resolved by Sentinel
+        @current_target_port = nil # Will be resolved by Sentinel
+      end
       
       # URI parsing block removed as configuration is direct and fixed.
       
-      @current_target_host = nil
-      @current_target_port = nil
-
       @defs = []
       @command_queue = []
       @reconnect_tries = 0
@@ -79,10 +91,21 @@ module EventMachine::Hiredis
       @permanent_failure = false
       @reconnect_tries = 0
       @connection_establishment_deferrable = EM::DefaultDeferrable.new
-      timeout_duration = (DEFAULT_MAX_CONNECT_RETRIES * DEFAULT_RECONNECT_DELAY) + 10 
-      @connection_establishment_deferrable.timeout(timeout_duration) if timeout_duration > 0
-      
-      _initiate_connection_attempt 
+      if @direct_connection_mode
+        # In direct mode, max retries and delay don't apply in the same way as Sentinel discovery.
+        # The connection attempt is more straightforward. Timeout can be shorter.
+        # For a single direct attempt, perhaps a simple, shorter timeout or rely on EM's default.
+        # Let's use a fixed timeout for direct connections for now.
+        @connection_establishment_deferrable.timeout(10) # E.g., 10 seconds for a direct connection attempt
+        EM::Hiredis.logger.debug { "#{_log_prefix} Direct connection mode: attempting to establish raw connection."}
+        # SSL options for direct connection are simply @ssl_options
+        _establish_raw_connection(@current_target_host, @current_target_port, @ssl_options)
+      else
+        # Sentinel-based connection with retries
+        timeout_duration = (DEFAULT_MAX_CONNECT_RETRIES * DEFAULT_RECONNECT_DELAY) + 10 
+        @connection_establishment_deferrable.timeout(timeout_duration) if timeout_duration > 0
+        _initiate_connection_attempt
+      end
       @connection_establishment_deferrable
     end
     
@@ -105,8 +128,12 @@ module EventMachine::Hiredis
 
     def _log_prefix
       prefix = "[EM::Hiredis::BaseClient"
-      prefix << " Sentinel: #{@sentinel_params[:master_name]}"
-      prefix << " Target: #{@current_target_host}:#{@current_target_port}" if @current_target_host
+      if @direct_connection_mode
+        prefix << " Direct: #{@current_target_host}:#{@current_target_port}"
+      else
+        prefix << " Sentinel: #{@sentinel_params[:master_name]}"
+        prefix << " Target: #{@current_target_host}:#{@current_target_port}" if @current_target_host
+      end
       prefix << "]"
       prefix
     end
@@ -137,7 +164,10 @@ module EventMachine::Hiredis
       sentinel_port = sentinel_conf[:port]
       sentinel_password = sentinel_conf[:password] || @sentinel_params[:sentinel_password]
       EM::Hiredis.logger.info { "#{_log_prefix} Connecting to Sentinel (SSL) #{sentinel_host}:#{sentinel_port} to find master '#{@sentinel_params[:master_name]}'." }
-      temp_sentinel_client = EventMachine::Hiredis::Client.new(sentinel_host, sentinel_port, sentinel_password, 0, @ssl_options, {}) 
+      # Instantiate the temporary client for Sentinel communication in direct connection mode.
+      # It uses the main @ssl_options for its connection to the Sentinel server.
+      # The db (0) and sentinel_params (:_direct_connect_) are specific to this internal usage.
+      temp_sentinel_client = self.class.new(sentinel_host, sentinel_port, sentinel_password, 0, @ssl_options, :_direct_connect_)
       sentinel_conn_df = temp_sentinel_client.connect
       sentinel_conn_df.callback do
         EM::Hiredis.logger.debug { "#{_log_prefix} Connected to Sentinel #{sentinel_host}:#{sentinel_port}." }
@@ -288,6 +318,27 @@ module EventMachine::Hiredis
       EM::Hiredis.logger.warn { "#{_log_prefix} Connection failure: #{reason_str}. Current tries: #{@reconnect_tries}."}
       _cancel_reconnect_timer 
       @fully_connected = false 
+
+      # If this is a direct_connection_mode client (e.g., a temporary client for Sentinel communication),
+      # a connection failure should immediately fail its top-level deferrable and not attempt Sentinel-based reconnections.
+      if @direct_connection_mode
+        EM::Hiredis.logger.warn { "#{_log_prefix} Direct connection failed. Failing establish deferrable." }
+        @permanent_failure = true # Mark as failed to prevent any other actions
+        @is_connecting = false    # No longer trying to connect
+        if @connection_establishment_deferrable && !@connection_establishment_deferrable.instance_variable_get(:@called)
+          @connection_establishment_deferrable.fail(Error.new("Direct connection failed: #{reason_str}"))
+        end
+        # For a direct_connection_mode client, we also need to fail any pending commands in @defs or @command_queue
+        # as there will be no further connection attempts for this instance.
+        @defs.each { |d| d.fail(Error.new("Direct connection failed: #{reason_str}")) unless d.instance_variable_get(:@called) }
+        @defs.clear
+        @command_queue.each do |df, _, _|
+          df.fail(Error.new("Direct connection failed: #{reason_str}")) unless df.instance_variable_get(:@called)
+        end
+        @command_queue.clear
+        return # Do not proceed with Sentinel retry logic for direct mode clients
+      end
+
       if @permanent_failure
          EM::Hiredis.logger.error { "#{_log_prefix} In permanent failure state. Not retrying."}
          if @connection_establishment_deferrable && !@connection_establishment_deferrable.instance_variable_get(:@called)
