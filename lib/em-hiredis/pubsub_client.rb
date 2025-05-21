@@ -15,9 +15,13 @@ module EventMachine::Hiredis
       @psub_callbacks = Hash.new { |h, k| h[k] = [] }
       
       # Resubsubscribe to channels on reconnect
-      on(:reconnected) {
-        raw_send_command(:subscribe, @subs) if @subs.any?
-        raw_send_command(:psubscribe, @psubs) if @psubs.any?
+      on(:connected) {
+        # Ensure we are fully connected and have a connection object.
+        # BaseClient guarantees this state before emitting :connected.
+        # Use send_command_direct from BaseClient for these state-changing commands.
+        # The arguments to subscribe/psubscribe should be splatted if @subs/@psubs are arrays of channels/patterns.
+        send_command_direct(:subscribe, *@subs) if @subs.any?
+        send_command_direct(:psubscribe, *@psubs) if @psubs.any?
       }
       
       super
@@ -34,8 +38,8 @@ module EventMachine::Hiredis
       if cb = proc || block
         @sub_callbacks[channel] << cb
       end
-      @subs << channel
-      raw_send_command(:subscribe, [channel])
+      @subs << channel unless @subs.include?(channel) # Avoid duplicates if called multiple times
+      raw_send_command(:subscribe, channel) # Pass channel directly
       return pubsub_deferrable(channel)
     end
     
@@ -46,7 +50,7 @@ module EventMachine::Hiredis
     def unsubscribe(channel)
       @sub_callbacks.delete(channel)
       @subs.delete(channel)
-      raw_send_command(:unsubscribe, [channel])
+      raw_send_command(:unsubscribe, channel) # Pass channel directly
       return pubsub_deferrable(channel)
     end
 
@@ -87,8 +91,8 @@ module EventMachine::Hiredis
       if cb = proc || block
         @psub_callbacks[pattern] << cb
       end
-      @psubs << pattern
-      raw_send_command(:psubscribe, [pattern])
+      @psubs << pattern unless @psubs.include?(pattern) # Avoid duplicates
+      raw_send_command(:psubscribe, pattern) # Pass pattern directly
       return pubsub_deferrable(pattern)
     end
 
@@ -99,7 +103,7 @@ module EventMachine::Hiredis
     def punsubscribe(pattern)
       @psub_callbacks.delete(pattern)
       @psubs.delete(pattern)
-      raw_send_command(:punsubscribe, [pattern])
+      raw_send_command(:punsubscribe, pattern) # Pass pattern directly
       return pubsub_deferrable(pattern)
     end
 
@@ -146,15 +150,19 @@ module EventMachine::Hiredis
     # Send a command to redis without adding a deferrable for it. This is
     # useful for commands for which replies work or need to be treated
     # differently
-    def raw_send_command(sym, args)
-      if @connected
-        @connection.send_command(sym, args)
+    def raw_send_command(sym, *redis_args) # Changed to accept splat args
+      # Use @fully_connected from BaseClient to check connection status
+      if @fully_connected && @connection
+        # Call BaseClient's send_command_direct, which handles calling @connection.send_command
+        send_command_direct(sym, *redis_args)
+        return true # Indicate command was attempted
       else
-        callback do
-          @connection.send_command(sym, args)
-        end
+        # Log that the command is not being sent immediately.
+        # It will be sent by the on(:connected) handler if it was a subscribe/psubscribe that modified @subs/@psubs.
+        # For unsubscribe/punsubscribe, if not connected, they effectively just update local state.
+        EM::Hiredis.logger.debug { "#{_log_prefix} PubSub command #{sym} with args #{redis_args.inspect} not sent (not fully connected). Will be handled by (re)subscription logic if applicable." }
+        return false # Indicate command was not sent
       end
-      return nil
     end
 
     def pubsub_deferrable(channel)
@@ -163,7 +171,8 @@ module EventMachine::Hiredis
       df
     end
 
-    def handle_reply(reply)
+    # Override _handle_reply from BaseClient
+    def _handle_reply(reply)
       if reply && PUBSUB_MESSAGES.include?(reply[0]) # reply can be nil
         # Note: pmessage is the only message with 4 arguments
         kind, subscription, d1, d2 = *reply
@@ -195,7 +204,7 @@ module EventMachine::Hiredis
           emit(kind.to_sym, subscription, d1)
         end
       else
-        super
+        super(reply) # Call BaseClient's _handle_reply
       end
     end
   end
