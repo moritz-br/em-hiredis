@@ -101,7 +101,11 @@ module EventMachine::Hiredis
         @connection_establishment_deferrable.timeout(timeout_duration) if timeout_duration > 0
         _initiate_connection_attempt
       end
-      @connection_establishment_deferrable
+      
+      # For backward compatibility with code that expects connect to return the client instance
+      # We return self, while still providing the deferrable for those who want to use it
+      # The deferrable is accessible via instance variable if needed
+      return self
     end
     
     def connected?
